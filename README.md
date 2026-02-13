@@ -1,6 +1,6 @@
 # Accretion Disk Simulation
 
-3D relativistic accretion disk simulation around a 10 solar mass black hole, built with Python and matplotlib.
+3D relativistic accretion disk simulation around a 10 solar mass black hole, built with Python and Vispy (GPU-accelerated OpenGL).
 
 ## Physics
 
@@ -15,14 +15,17 @@
 - **Variable particle size** — inner particles are larger/more intense
 - **Fading trails** — transparent at the tail, semi-opaque at the head
 - Solid black hole shadow with photon ring at ~2.6 r_s
-- Axes normalized to Schwarzschild radii (r_s)
+- Positions normalized to Schwarzschild radii (r_s)
+- Interactive camera — drag to rotate, scroll to zoom, middle-click to pan
 
 ## Requirements
 
 ```
 numpy
-matplotlib
 scipy
+vispy
+PyOpenGL
+PyQt6
 ```
 
 ## Usage
@@ -31,14 +34,7 @@ scipy
 python3 accretion_disk.py
 ```
 
-The animation window will open with a slowly rotating camera view. Close the window to exit.
-
-To save as video or GIF, uncomment the lines at the bottom of the script:
-
-```python
-anim.save('accretion_disk_3d.mp4', writer='ffmpeg', fps=20, dpi=150)
-anim.save('accretion_disk_3d.gif', writer='pillow', fps=20, dpi=100)
-```
+The animation window will open with a slowly rotating camera. Drag to rotate, scroll to zoom, middle-click to pan. Close the window to exit.
 
 ## Parameters
 
