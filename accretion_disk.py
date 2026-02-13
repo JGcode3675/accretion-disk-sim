@@ -1,10 +1,7 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.animation import FuncAnimation
-from matplotlib.colors import Normalize, LinearSegmentedColormap
-from matplotlib.cm import ScalarMappable
 from scipy.integrate import odeint
+from vispy import app, scene
+from vispy.geometry import create_sphere
 
 
 # --- Constants ---
@@ -147,179 +144,186 @@ velocities = calculate_velocities_3d(trajectories)
 v_min, v_max = np.percentile(velocities, [5, 95])
 
 
-# --- 3D Animation Setup ---
-plt.style.use('dark_background')
-fig = plt.figure(figsize=(12, 10), dpi=120)
-ax = fig.add_subplot(111, projection='3d')
+# --- Custom Colormap ---
+def accretion_colormap(values):
+    """Map normalized [0,1] values to RGBA. Dark red → orange → yellow → white → blue-white."""
+    values = np.clip(np.atleast_1d(values), 0, 1)
+    cpoints = np.array([
+        [0.0, 0.15, 0.0, 0.0],
+        [0.2, 0.70, 0.1, 0.0],
+        [0.4, 1.00, 0.4, 0.0],
+        [0.6, 1.00, 0.8, 0.2],
+        [0.8, 1.00, 1.0, 0.9],
+        [1.0, 0.70, 0.85, 1.0],
+    ])
+    colors = np.ones((len(values), 4))
+    for ch in range(3):
+        colors[:, ch] = np.interp(values, cpoints[:, 0], cpoints[:, ch + 1])
+    return colors.astype(np.float32)
 
-# Custom accretion disk colormap: dark red → orange → yellow → white → blue-white
-disk_colors = [
-    (0.0, (0.15, 0.0, 0.0)),     # deep dark red
-    (0.2, (0.7, 0.1, 0.0)),      # dark red-orange
-    (0.4, (1.0, 0.4, 0.0)),      # orange
-    (0.6, (1.0, 0.8, 0.2)),      # yellow
-    (0.8, (1.0, 1.0, 0.9)),      # white-hot
-    (1.0, (0.7, 0.85, 1.0)),     # blue-white
-]
-cmap = LinearSegmentedColormap.from_list('accretion', disk_colors, N=256)
-norm = Normalize(vmin=v_min, vmax=v_max)
-sm = ScalarMappable(cmap=cmap, norm=norm)
-sm.set_array([])
 
-# Plot limits (in r_s units)
+def norm_velocity(v):
+    """Normalize velocity values to [0,1] range."""
+    return np.clip((v - v_min) / (v_max - v_min + 1e-30), 0, 1)
+
+
+# --- Vispy Scene Setup ---
+canvas = scene.SceneCanvas(
+    keys='interactive', size=(1400, 1000), bgcolor='black',
+    title='Relativistic Accretion Disk'
+)
+view = canvas.central_widget.add_view()
+
 plot_limit = r_outer * 1.2 / r_s
-z_limit = r_outer * 0.15 / r_s  # Smaller z range to emphasize disk thinness
+view.camera = scene.TurntableCamera(
+    elevation=25, azimuth=-60,
+    distance=plot_limit * 2.5, fov=45
+)
 
-# Viewing angle (elevation and azimuth)
-view_elev = 25  # Degrees above the disk plane
-view_azim = -60  # Rotation around z-axis
+# --- Black hole shadow sphere (2.6 r_s) ---
+sphere_data = create_sphere(rows=30, cols=30, radius=2.6)
+black_hole = scene.visuals.Mesh(
+    vertices=sphere_data.get_vertices(),
+    faces=sphere_data.get_faces(),
+    color=(0.02, 0.02, 0.02, 1.0),
+    parent=view.scene
+)
+
+# --- Photon ring at shadow edge ---
+theta_ring = np.linspace(0, 2 * np.pi, 200)
+ring_pos = np.column_stack([
+    2.6 * np.cos(theta_ring),
+    2.6 * np.sin(theta_ring),
+    np.zeros(200)
+])
+photon_ring = scene.visuals.Line(
+    pos=ring_pos, color=(1.0, 0.82, 0.5, 0.9),
+    width=2.5, parent=view.scene, method='gl'
+)
+
+# --- ISCO ring ---
+isco_r = r_isco / r_s
+isco_pos = np.column_stack([
+    isco_r * np.cos(theta_ring),
+    isco_r * np.sin(theta_ring),
+    np.zeros(200)
+])
+isco_ring = scene.visuals.Line(
+    pos=isco_pos, color=(0.0, 1.0, 1.0, 0.3),
+    width=1.5, parent=view.scene, method='gl'
+)
+
+# --- Particle markers ---
+scatter = scene.visuals.Markers(parent=view.scene)
+
+# --- Trail lines (pre-allocated fixed-size buffers to prevent flickering) ---
+trail_frames = 15
+_max_trail_verts = num_particles * trail_frames * 2  # 2 vertices per segment
+trail_pos_buf = np.zeros((_max_trail_verts, 3), dtype=np.float32)
+trail_clr_buf = np.zeros((_max_trail_verts, 4), dtype=np.float32)
+trails_visual = scene.visuals.Line(
+    pos=trail_pos_buf, color=trail_clr_buf, connect='segments',
+    parent=view.scene, method='gl', width=1.0, antialias=True
+)
+
+# --- Animation state ---
+current_frame = [0]
 
 
-def draw_solid_sphere(ax, radius_rs, color, alpha=0.95):
-    """Draw a solid sphere for the black hole shadow (radius in r_s units)."""
-    u = np.linspace(0, 2 * np.pi, 30)
-    v = np.linspace(0, np.pi, 20)
-    x = radius_rs * np.outer(np.cos(u), np.sin(v))
-    y = radius_rs * np.outer(np.sin(u), np.sin(v))
-    z = radius_rs * np.outer(np.ones(np.size(u)), np.cos(v))
-    ax.plot_surface(x, y, z, color=color, alpha=alpha, shade=False)
+def update(event):
+    frame = current_frame[0]
 
+    # Auto-rotate camera
+    view.camera.azimuth = -60 + frame * 0.3
 
-def draw_circle_3d(ax, radius_rs, color, linestyle='-', alpha=0.5, z_offset=0, linewidth=1):
-    """Draw a circle in the xy-plane (radius in r_s units)."""
-    theta = np.linspace(0, 2 * np.pi, 100)
-    x = radius_rs * np.cos(theta)
-    y = radius_rs * np.sin(theta)
-    z = np.full_like(theta, z_offset)
-    ax.plot(x, y, z, color=color, linestyle=linestyle, alpha=alpha, linewidth=linewidth)
-
-
-def init():
-    ax.set_xlim(-plot_limit, plot_limit)
-    ax.set_ylim(-plot_limit, plot_limit)
-    ax.set_zlim(-z_limit, z_limit)
-    ax.set_xlabel('x / $r_s$', fontsize=10, labelpad=8)
-    ax.set_ylabel('y / $r_s$', fontsize=10, labelpad=8)
-    ax.set_zlabel('z / $r_s$', fontsize=10, labelpad=8)
-    ax.view_init(elev=view_elev, azim=view_azim)
-    return []
-
-
-def update(frame):
-    ax.clear()
-    ax.set_xlim(-plot_limit, plot_limit)
-    ax.set_ylim(-plot_limit, plot_limit)
-    ax.set_zlim(-z_limit, z_limit)
-
-    current_azim = view_azim + frame * 0.3  # Slow rotation
-    ax.view_init(elev=view_elev, azim=current_azim)
-
-    # --- Black hole shadow (solid dark sphere at ~2.6 r_s) ---
-    draw_solid_sphere(ax, 2.6, 'black', alpha=0.95)
-
-    # --- Photon ring (bright thin ring at shadow edge) ---
-    draw_circle_3d(ax, 2.6, '#FFD080', linestyle='-', alpha=0.8, linewidth=1.5)
-
-    # --- ISCO circle ---
-    draw_circle_3d(ax, r_isco / r_s, 'cyan', linestyle='--', alpha=0.4)
-
-    # --- Get particle positions (in meters) ---
-    positions_x = trajectories[:, frame, 0]
-    positions_y = trajectories[:, frame, 1]
-    positions_z = trajectories[:, frame, 2]
-    vel_x = trajectories[:, frame, 3]
-    vel_y = trajectories[:, frame, 4]
+    # Particle data for this frame
+    positions = trajectories[:, frame, :3]
+    vel_xy = trajectories[:, frame, 3:5]
     vels = velocities[:, frame]
 
-    # Filter out particles that have fallen in
-    r = np.sqrt(positions_x**2 + positions_y**2 + positions_z**2)
+    # Filter fallen particles
+    r = np.linalg.norm(positions, axis=1)
     mask = r > r_s * 1.1
+    active = np.where(mask)[0]
+    n_active = len(active)
 
-    # Convert positions to r_s units for plotting
-    px = positions_x[mask] / r_s
-    py = positions_y[mask] / r_s
-    pz = positions_z[mask] / r_s
-    r_masked = r[mask] / r_s
+    if n_active == 0:
+        current_frame[0] = (frame + 1) % num_frames
+        return
+
+    # Positions in r_s units
+    pos_rs = positions[active] / r_s
+    r_rs = r[active] / r_s
 
     # --- Doppler beaming ---
-    # Camera direction in the xy-plane based on rotating azimuth
-    azim_rad = np.radians(current_azim)
-    cam_dir_x = -np.cos(azim_rad)
-    cam_dir_y = -np.sin(azim_rad)
-
-    # Line-of-sight velocity component (positive = approaching camera)
-    v_los = vel_x[mask] * cam_dir_x + vel_y[mask] * cam_dir_y
+    azim_rad = np.radians(view.camera.azimuth)
+    cam_dir = np.array([-np.cos(azim_rad), -np.sin(azim_rad)])
+    v_los = vel_xy[active, 0] * cam_dir[0] + vel_xy[active, 1] * cam_dir[1]
     v_los_norm = v_los / (np.max(np.abs(v_los)) + 1e-30)
-    # Boost: approaching side brighter (alpha 0.5→1.0), receding dimmer (0.3→0.5)
-    doppler_alpha = 0.5 + 0.5 * v_los_norm
-    doppler_alpha = np.clip(doppler_alpha, 0.2, 1.0)
+    doppler_alpha = np.clip(0.5 + 0.5 * v_los_norm, 0.15, 1.0)
 
-    # --- Variable particle size (inner = larger/brighter) ---
-    r_min_plot = r_isco / r_s
-    r_max_plot = r_outer / r_s
-    size_scale = 1.0 - np.clip((r_masked - r_min_plot) / (r_max_plot - r_min_plot), 0, 1)
-    particle_sizes = 6 + 30 * size_scale  # Range: 6 (outer) to 36 (inner)
+    # --- Variable particle size (inner = larger) ---
+    r_min_p = r_isco / r_s
+    r_max_p = r_outer / r_s
+    size_scale = 1.0 - np.clip((r_rs - r_min_p) / (r_max_p - r_min_p), 0, 1)
+    sizes = 4 + 18 * size_scale
 
-    # --- Plot particles colored by velocity, sized by radius, alpha by Doppler ---
-    base_colors = cmap(norm(vels[mask]))
-    base_colors[:, 3] = doppler_alpha  # Modulate alpha channel
-    ax.scatter(px, py, pz, c=base_colors, s=particle_sizes, depthshade=True,
-               edgecolors='none')
+    # --- Colors from custom colormap + Doppler alpha ---
+    v_norm = norm_velocity(vels[active])
+    colors = accretion_colormap(v_norm)
+    colors[:, 3] = doppler_alpha
 
-    # --- Draw trailing paths with fade gradient ---
-    trail_length = min(15, frame)
-    if trail_length > 1:
-        for i in range(num_particles):
-            if mask[i]:
-                t_start = max(0, frame - trail_length)
-                trail_x = trajectories[i, t_start:frame + 1, 0] / r_s
-                trail_y = trajectories[i, t_start:frame + 1, 1] / r_s
-                trail_z = trajectories[i, t_start:frame + 1, 2] / r_s
-                trail_color = cmap(norm(vels[i]))
-                n_seg = len(trail_x) - 1
-                for seg in range(n_seg):
-                    seg_alpha = 0.05 + 0.35 * (seg / max(n_seg - 1, 1))
-                    ax.plot(trail_x[seg:seg + 2], trail_y[seg:seg + 2],
-                            trail_z[seg:seg + 2], color=trail_color,
-                            alpha=seg_alpha, linewidth=0.8)
+    scatter.set_data(
+        pos_rs.astype(np.float32),
+        face_color=colors, size=sizes,
+        edge_width=0, edge_color=None
+    )
 
-    # --- Labels and title ---
-    ax.set_xlabel('x / $r_s$', fontsize=10, labelpad=8)
-    ax.set_ylabel('y / $r_s$', fontsize=10, labelpad=8)
-    ax.set_zlabel('z / $r_s$', fontsize=10, labelpad=8)
+    # --- Trails (fill pre-allocated buffers, no GPU reallocation) ---
+    trail_pos_buf[:] = 0
+    trail_clr_buf[:] = 0
+
+    t_start = max(0, frame - trail_frames)
+    n_pts = frame - t_start + 1
+
+    if n_pts >= 2:
+        n_segs = n_pts - 1
+        all_trails = trajectories[active, t_start:frame + 1, :3] / r_s
+
+        starts = all_trails[:, :-1, :].reshape(-1, 3)
+        ends = all_trails[:, 1:, :].reshape(-1, 3)
+        total = n_active * n_segs
+        used = total * 2
+
+        trail_pos_buf[:used:2] = starts
+        trail_pos_buf[1:used:2] = ends
+
+        base_colors = accretion_colormap(norm_velocity(vels[active]))
+        alphas = (0.03 + 0.25 * np.arange(n_segs) / max(n_segs - 1, 1)).astype(np.float32)
+
+        seg_colors = np.repeat(base_colors, n_segs * 2, axis=0)
+        alpha_pattern = np.repeat(alphas, 2)
+        alpha_tiled = np.tile(alpha_pattern, n_active)
+        seg_colors[:, 3] = alpha_tiled
+        trail_clr_buf[:used] = seg_colors
+
+    trails_visual.set_data(pos=trail_pos_buf, color=trail_clr_buf, connect='segments')
+
+    # --- Update window title ---
     time_orbits = t[frame] / T_inner
-    particles_remaining = np.sum(mask)
-    ax.set_title(f'Relativistic Accretion Disk  (Paczy\u0144ski\u2013Wiita)\n'
-                 f't = {time_orbits:.2f} orbits   |   '
-                 f'{particles_remaining}/{num_particles} particles',
-                 fontsize=11, color='#cccccc')
+    canvas.title = (
+        f'Accretion Disk (Paczy\u0144ski\u2013Wiita)  |  '
+        f't = {time_orbits:.2f} orbits  |  '
+        f'{n_active}/{num_particles} particles'
+    )
 
-    # --- Clean dark background ---
-    ax.set_facecolor('black')
-    ax.xaxis.pane.fill = False
-    ax.yaxis.pane.fill = False
-    ax.zaxis.pane.fill = False
-    ax.xaxis.pane.set_edgecolor((1, 1, 1, 0.05))
-    ax.yaxis.pane.set_edgecolor((1, 1, 1, 0.05))
-    ax.zaxis.pane.set_edgecolor((1, 1, 1, 0.05))
-    ax.grid(False)
-
-    return []
+    canvas.update()
+    current_frame[0] = (frame + 1) % num_frames
 
 
-# --- Create Animation ---
-anim = FuncAnimation(fig, update, frames=num_frames, init_func=init,
-                     blit=False, interval=50)
+timer = app.Timer(interval=1/30, connect=update, start=True)
 
-# Add colorbar
-cbar = fig.colorbar(sm, ax=ax, label='Velocity (m/s)', shrink=0.6, pad=0.1)
-
-plt.tight_layout()
 print("Animation ready. Displaying...")
-plt.show()
-
-
-# --- Optional: Save animation ---
-# Uncomment to save as MP4 (requires ffmpeg) or GIF
-# anim.save('accretion_disk_3d.mp4', writer='ffmpeg', fps=20, dpi=150)
-# anim.save('accretion_disk_3d.gif', writer='pillow', fps=20, dpi=100)
+print("Controls: drag to rotate, scroll to zoom, middle-click to pan")
+canvas.show()
+app.run()
