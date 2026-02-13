@@ -18,14 +18,12 @@
 - Positions normalized to Schwarzschild radii (r_s)
 - Interactive camera — drag to rotate, scroll to zoom, middle-click to pan
 
-## Requirements
+## Setup
 
-```
-numpy
-scipy
-vispy
-PyOpenGL
-PyQt6
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ## Usage
